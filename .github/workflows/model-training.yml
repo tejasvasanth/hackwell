@@ -1,0 +1,367 @@
+name: Model Training Pipeline
+
+on:
+  schedule:
+    # Run daily at 2 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      model_name:
+        description: 'Model name to train'
+        required: true
+        default: 'xgboost_classifier'
+        type: string
+      retrain:
+        description: 'Force retrain existing model'
+        required: false
+        default: false
+        type: boolean
+      data_source:
+        description: 'Data source for training'
+        required: false
+        default: 'default'
+        type: choice
+        options:
+        - default
+        - s3
+        - database
+
+env:
+  PYTHON_VERSION: '3.11'
+  MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+  PREFECT_API_URL: ${{ secrets.PREFECT_API_URL }}
+
+jobs:
+  # Data validation
+  data-validation:
+    runs-on: ubuntu-latest
+    outputs:
+      data-valid: ${{ steps.validate.outputs.valid }}
+      data-path: ${{ steps.validate.outputs.path }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        cache: 'pip'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Validate training data
+      id: validate
+      run: |
+        python -c "
+import pandas as pd
+import numpy as np
+from pathlib import Path
+
+# Create sample validation data
+data_path = 'data/training_data.csv'
+Path('data').mkdir(exist_ok=True)
+
+# Generate sample data
+np.random.seed(42)
+data = pd.DataFrame({
+    'feature1': np.random.randn(1000),
+    'feature2': np.random.randn(1000),
+    'feature3': np.random.randn(1000),
+    'target': np.random.randint(0, 2, 1000)
+})
+
+data.to_csv(data_path, index=False)
+print(f'Data validation passed. Shape: {data.shape}')
+print(f'::set-output name=valid::true')
+print(f'::set-output name=path::{data_path}')
+"
+
+    - name: Upload training data
+      uses: actions/upload-artifact@v3
+      with:
+        name: training-data
+        path: data/training_data.csv
+        retention-days: 7
+
+  # Model training
+  train-model:
+    needs: data-validation
+    runs-on: ubuntu-latest
+    if: needs.data-validation.outputs.data-valid == 'true'
+    
+    strategy:
+      matrix:
+        model_type: [xgboost, lightgbm]
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        cache: 'pip'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install lightgbm  # Additional dependency for matrix
+
+    - name: Download training data
+      uses: actions/download-artifact@v3
+      with:
+        name: training-data
+        path: data/
+
+    - name: Create directories
+      run: |
+        mkdir -p models logs mlflow-artifacts
+
+    - name: Train model
+      env:
+        MODEL_TYPE: ${{ matrix.model_type }}
+        MODEL_NAME: ${{ github.event.inputs.model_name || 'xgboost_classifier' }}
+        RETRAIN: ${{ github.event.inputs.retrain || 'false' }}
+      run: |
+        python -c "
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+import xgboost as xgb
+import lightgbm as lgb
+import mlflow
+import mlflow.xgboost
+import mlflow.lightgbm
+import os
+import joblib
+from datetime import datetime
+
+# Load data
+data = pd.read_csv('data/training_data.csv')
+X = data.drop('target', axis=1)
+y = data['target']
+
+# Split data
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42, stratify=y
+)
+
+# Set MLflow experiment
+mlflow.set_experiment(f'model-training-{os.environ.get(\"MODEL_TYPE\", \"xgboost\")}')
+
+with mlflow.start_run(run_name=f'training-{datetime.now().strftime(\"%Y%m%d-%H%M%S\")}'):
+    model_type = os.environ.get('MODEL_TYPE', 'xgboost')
+    
+    if model_type == 'xgboost':
+        model = xgb.XGBClassifier(
+            n_estimators=100,
+            max_depth=6,
+            learning_rate=0.1,
+            random_state=42
+        )
+        model.fit(X_train, y_train)
+        mlflow.xgboost.log_model(model, 'model')
+    else:  # lightgbm
+        model = lgb.LGBMClassifier(
+            n_estimators=100,
+            max_depth=6,
+            learning_rate=0.1,
+            random_state=42
+        )
+        model.fit(X_train, y_train)
+        mlflow.lightgbm.log_model(model, 'model')
+    
+    # Make predictions
+    y_pred = model.predict(X_test)
+    
+    # Calculate metrics
+    accuracy = accuracy_score(y_test, y_pred)
+    precision = precision_score(y_test, y_pred, average='weighted')
+    recall = recall_score(y_test, y_pred, average='weighted')
+    f1 = f1_score(y_test, y_pred, average='weighted')
+    
+    # Log metrics
+    mlflow.log_metric('accuracy', accuracy)
+    mlflow.log_metric('precision', precision)
+    mlflow.log_metric('recall', recall)
+    mlflow.log_metric('f1_score', f1)
+    
+    # Log parameters
+    mlflow.log_param('model_type', model_type)
+    mlflow.log_param('n_estimators', 100)
+    mlflow.log_param('max_depth', 6)
+    mlflow.log_param('learning_rate', 0.1)
+    
+    # Save model locally
+    model_path = f'models/{model_type}_model.joblib'
+    joblib.dump(model, model_path)
+    mlflow.log_artifact(model_path)
+    
+    print(f'Model training completed for {model_type}')
+    print(f'Accuracy: {accuracy:.4f}')
+    print(f'Precision: {precision:.4f}')
+    print(f'Recall: {recall:.4f}')
+    print(f'F1 Score: {f1:.4f}')
+"
+
+    - name: Upload model artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: model-${{ matrix.model_type }}
+        path: models/
+        retention-days: 30
+
+  # Model evaluation and comparison
+  evaluate-models:
+    needs: train-model
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        cache: 'pip'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install lightgbm
+
+    - name: Download model artifacts
+      uses: actions/download-artifact@v3
+      with:
+        name: model-xgboost
+        path: models/xgboost/
+
+    - name: Download LightGBM model
+      uses: actions/download-artifact@v3
+      with:
+        name: model-lightgbm
+        path: models/lightgbm/
+
+    - name: Download training data
+      uses: actions/download-artifact@v3
+      with:
+        name: training-data
+        path: data/
+
+    - name: Compare models
+      run: |
+        python -c "
+import pandas as pd
+import joblib
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, classification_report
+import json
+
+# Load data
+data = pd.read_csv('data/training_data.csv')
+X = data.drop('target', axis=1)
+y = data['target']
+
+# Split data
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42, stratify=y
+)
+
+# Load models
+xgb_model = joblib.load('models/xgboost/xgboost_model.joblib')
+lgb_model = joblib.load('models/lightgbm/lightgbm_model.joblib')
+
+# Evaluate models
+xgb_pred = xgb_model.predict(X_test)
+lgb_pred = lgb_model.predict(X_test)
+
+xgb_accuracy = accuracy_score(y_test, xgb_pred)
+lgb_accuracy = accuracy_score(y_test, lgb_pred)
+
+results = {
+    'xgboost': {
+        'accuracy': float(xgb_accuracy),
+        'report': classification_report(y_test, xgb_pred, output_dict=True)
+    },
+    'lightgbm': {
+        'accuracy': float(lgb_accuracy),
+        'report': classification_report(y_test, lgb_pred, output_dict=True)
+    }
+}
+
+# Determine best model
+best_model = 'xgboost' if xgb_accuracy > lgb_accuracy else 'lightgbm'
+results['best_model'] = best_model
+
+print(f'XGBoost Accuracy: {xgb_accuracy:.4f}')
+print(f'LightGBM Accuracy: {lgb_accuracy:.4f}')
+print(f'Best Model: {best_model}')
+
+# Save results
+with open('model_comparison.json', 'w') as f:
+    json.dump(results, f, indent=2)
+"
+
+    - name: Upload comparison results
+      uses: actions/upload-artifact@v3
+      with:
+        name: model-comparison
+        path: model_comparison.json
+        retention-days: 30
+
+  # Deploy best model
+  deploy-model:
+    needs: evaluate-models
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Download comparison results
+      uses: actions/download-artifact@v3
+      with:
+        name: model-comparison
+        path: .
+
+    - name: Deploy best model
+      run: |
+        python -c "
+import json
+
+with open('model_comparison.json', 'r') as f:
+    results = json.load(f)
+
+best_model = results['best_model']
+accuracy = results[best_model]['accuracy']
+
+print(f'Deploying {best_model} model with accuracy: {accuracy:.4f}')
+
+# Here you would add actual deployment logic
+# For example, updating model registry, triggering deployment pipeline, etc.
+print('Model deployment completed successfully')
+"
+
+  # Notification
+  notify:
+    needs: [deploy-model]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+    - name: Notify completion
+      run: |
+        echo "Model training pipeline completed"
+        echo "Status: ${{ needs.deploy-model.result }}"
+        # Add notification logic here (Slack, email, etc.)

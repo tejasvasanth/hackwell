@@ -1,0 +1,171 @@
+version: '3.8'
+
+services:
+  # FastAPI service
+  api:
+    build:
+      context: .
+      target: api
+    ports:
+      - "8000:8000"
+    environment:
+      - PYTHONPATH=/app
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+      - PREFECT_API_URL=http://prefect-server:4200/api
+    volumes:
+      - ./models:/app/models
+      - ./logs:/app/logs
+      - ./data:/app/data
+    depends_on:
+      - mlflow
+      - postgres
+    networks:
+      - ml-network
+    restart: unless-stopped
+
+  # Streamlit dashboard
+  dashboard:
+    build:
+      context: .
+      target: dashboard
+    ports:
+      - "8501:8501"
+    environment:
+      - PYTHONPATH=/app
+    volumes:
+      - ./logs:/app/logs
+      - ./data:/app/data
+    depends_on:
+      - api
+    networks:
+      - ml-network
+    restart: unless-stopped
+
+  # MLflow tracking server
+  mlflow:
+    build:
+      context: .
+      target: mlflow
+    ports:
+      - "5000:5000"
+    environment:
+      - MLFLOW_BACKEND_STORE_URI=postgresql://mlflow:mlflow@postgres:5432/mlflow
+      - MLFLOW_DEFAULT_ARTIFACT_ROOT=/app/mlflow-artifacts
+    volumes:
+      - ./mlflow-artifacts:/app/mlflow-artifacts
+      - ./mlruns:/app/mlruns
+    depends_on:
+      - postgres
+    networks:
+      - ml-network
+    restart: unless-stopped
+
+  # Prefect server
+  prefect-server:
+    image: prefecthq/prefect:2.14.11-python3.11
+    ports:
+      - "4200:4200"
+    environment:
+      - PREFECT_UI_URL=http://localhost:4200/api
+      - PREFECT_API_URL=http://localhost:4200/api
+      - PREFECT_SERVER_API_HOST=0.0.0.0
+      - PREFECT_API_DATABASE_CONNECTION_URL=postgresql+asyncpg://prefect:prefect@postgres:5432/prefect
+    command: prefect server start --host 0.0.0.0
+    depends_on:
+      - postgres
+    networks:
+      - ml-network
+    restart: unless-stopped
+
+  # Prefect worker
+  prefect-worker:
+    build:
+      context: .
+      target: prefect-worker
+    environment:
+      - PREFECT_API_URL=http://prefect-server:4200/api
+      - PYTHONPATH=/app
+    volumes:
+      - ./models:/app/models
+      - ./logs:/app/logs
+      - ./data:/app/data
+      - ./feast_repo:/app/feast_repo
+    depends_on:
+      - prefect-server
+      - postgres
+    networks:
+      - ml-network
+    restart: unless-stopped
+
+  # PostgreSQL database
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
+    networks:
+      - ml-network
+    restart: unless-stopped
+
+  # Redis for caching
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - ml-network
+    restart: unless-stopped
+
+  # Nginx reverse proxy
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./docker/nginx.conf:/etc/nginx/nginx.conf
+      - ./docker/ssl:/etc/nginx/ssl
+    depends_on:
+      - api
+      - dashboard
+    networks:
+      - ml-network
+    restart: unless-stopped
+
+  # Jupyter notebook (development)
+  jupyter:
+    build:
+      context: .
+      target: development
+    ports:
+      - "8888:8888"
+    environment:
+      - JUPYTER_ENABLE_LAB=yes
+      - PYTHONPATH=/app
+    volumes:
+      - ./notebooks:/app/notebooks
+      - ./data:/app/data
+      - ./models:/app/models
+    command: >
+      bash -c "jupyter lab --ip=0.0.0.0 --port=8888 --no-browser 
+               --allow-root --NotebookApp.token='' --NotebookApp.password=''"
+    networks:
+      - ml-network
+    profiles:
+      - development
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  ml-network:
+    driver: bridge
