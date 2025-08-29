@@ -8,6 +8,12 @@ import requests
 import json
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
+import sys
+import os
+
+# Add parent directory to path for imports
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from config.supabase_client import supabase_client
 
 # Page configuration
 st.set_page_config(
@@ -56,50 +62,134 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# API Configuration
+# API Configuration (fallback for some endpoints)
 API_BASE_URL = "http://localhost:8000"
 
-class APIClient:
-    """Client for interacting with FastAPI backend"""
+class DataClient:
+    """Client for interacting with Supabase and API backend"""
     
-    def __init__(self, base_url: str):
-        self.base_url = base_url
+    def __init__(self):
+        self.supabase = supabase_client
         self.session = requests.Session()
     
     def get_health_status(self) -> Dict:
-        """Check API health status"""
+        """Check Supabase connection status"""
         try:
-            response = self.session.get(f"{self.base_url}/health", timeout=5)
-            return {"status": "healthy", "data": response.json()}
+            # Test Supabase connection
+            result = self.supabase.client.table("patients").select("id").limit(1).execute()
+            return {"status": "healthy", "data": {"message": "Supabase connected"}}
         except Exception as e:
             return {"status": "error", "message": str(e)}
     
     def get_patients(self) -> Dict:
-        """Get list of all patients"""
+        """Get list of all patients from Supabase"""
         try:
-            response = self.session.get(f"{self.base_url}/patients", timeout=10)
-            if response.status_code == 200:
-                return {"status": "success", "data": response.json()}
+            result = self.supabase.client.table("patients").select(
+                "id, name, age, gender, smoking, exercise, bp, cholesterol, diabetes_status, created_at"
+            ).execute()
+            
+            if result.data:
+                return {"status": "success", "data": {"patients": result.data}}
             else:
-                return {"status": "error", "message": f"API Error: {response.status_code}"}
+                return {"status": "success", "data": {"patients": []}}
         except Exception as e:
             return {"status": "error", "message": str(e)}
     
     def get_patient_data(self, patient_id: str) -> Dict:
-        """Get detailed patient data"""
+        """Get detailed patient data from Supabase"""
         try:
-            response = self.session.get(f"{self.base_url}/patients/{patient_id}", timeout=10)
-            if response.status_code == 200:
-                return {"status": "success", "data": response.json()}
-            else:
-                return {"status": "error", "message": f"API Error: {response.status_code}"}
+            # Get patient basic info
+            patient_result = self.supabase.client.table("patients").select("*").eq("id", patient_id).execute()
+            
+            if not patient_result.data:
+                return {"status": "error", "message": "Patient not found"}
+            
+            patient = patient_result.data[0]
+            
+            # Get lab results
+            lab_result = self.supabase.client.table("lab_results").select("*").eq("patient_id", patient_id).order("test_date", desc=True).limit(10).execute()
+            
+            # Get lifestyle data
+            lifestyle_result = self.supabase.client.table("lifestyle_data").select("*").eq("patient_id", patient_id).order("recorded_date", desc=True).limit(10).execute()
+            
+            # Format data for dashboard compatibility
+            formatted_data = {
+                "id": patient["id"],
+                "name": patient["name"],
+                "age": patient["age"],
+                "gender": patient["gender"],
+                "demographics": {
+                    "height": patient.get("height", 170),
+                    "weight": patient.get("weight", 70),
+                    "bmi": patient.get("bmi", 24.2),
+                    "blood_type": patient.get("blood_type", "O+"),
+                    "phone": patient.get("phone", "N/A"),
+                    "emergency_contact": patient.get("emergency_contact", "N/A")
+                },
+                "lab_results": self._format_lab_results(lab_result.data),
+                "lifestyle_data": self._format_lifestyle_data(lifestyle_result.data, patient)
+            }
+            
+            return {"status": "success", "data": formatted_data}
         except Exception as e:
             return {"status": "error", "message": str(e)}
     
+    def _format_lab_results(self, lab_data: List[Dict]) -> Dict:
+        """Format lab results for dashboard display"""
+        if not lab_data:
+            return {
+                "cholesterol": 200, "hdl": 50, "ldl": 120, "triglycerides": 150,
+                "glucose": 90, "hba1c": 5.5, "systolic_bp": 120, "diastolic_bp": 80,
+                "last_test_date": "2024-01-01"
+            }
+        
+        # Group by test type and get latest values
+        latest_results = {}
+        for result in lab_data:
+            test_type = result["test_type"]
+            if test_type not in latest_results or result["test_date"] > latest_results[test_type]["test_date"]:
+                latest_results[test_type] = result
+        
+        return {
+            "cholesterol": latest_results.get("cholesterol_total", {}).get("value", 200),
+            "hdl": latest_results.get("cholesterol_hdl", {}).get("value", 50),
+            "ldl": latest_results.get("cholesterol_ldl", {}).get("value", 120),
+            "triglycerides": latest_results.get("triglycerides", {}).get("value", 150),
+            "glucose": latest_results.get("glucose", {}).get("value", 90),
+            "hba1c": latest_results.get("hba1c", {}).get("value", 5.5),
+            "systolic_bp": latest_results.get("bp_systolic", {}).get("value", 120),
+            "diastolic_bp": latest_results.get("bp_diastolic", {}).get("value", 80),
+            "last_test_date": max([r["test_date"] for r in lab_data]) if lab_data else "2024-01-01"
+        }
+    
+    def _format_lifestyle_data(self, lifestyle_data: List[Dict], patient: Dict) -> Dict:
+        """Format lifestyle data for dashboard display"""
+        if lifestyle_data:
+            latest = lifestyle_data[0]
+            return {
+                "smoking_status": patient.get("smoking", "Never"),
+                "alcohol_consumption": latest.get("alcohol_consumption", "None"),
+                "exercise_frequency": patient.get("exercise", 3),
+                "diet_type": latest.get("diet_type", "Balanced"),
+                "sleep_hours": latest.get("sleep_hours", 7),
+                "stress_level": latest.get("stress_level", 3),
+                "family_history": patient.get("family_history", False)
+            }
+        else:
+            return {
+                "smoking_status": patient.get("smoking", "Never"),
+                "alcohol_consumption": "None",
+                "exercise_frequency": patient.get("exercise", 3),
+                "diet_type": "Balanced",
+                "sleep_hours": 7,
+                "stress_level": 3,
+                "family_history": patient.get("family_history", False)
+            }
+    
     def predict_patient_risk(self, patient_id: str) -> Dict:
-        """Get risk prediction for specific patient"""
+        """Get risk prediction for specific patient (fallback to API)"""
         try:
-            response = self.session.get(f"{self.base_url}/predict/{patient_id}", timeout=10)
+            response = self.session.get(f"{API_BASE_URL}/predict/{patient_id}", timeout=10)
             if response.status_code == 200:
                 return {"status": "success", "data": response.json()}
             else:
@@ -108,9 +198,9 @@ class APIClient:
             return {"status": "error", "message": str(e)}
     
     def get_patient_recommendations(self, patient_id: str) -> Dict:
-        """Get recommendations for specific patient"""
+        """Get recommendations for specific patient (fallback to API)"""
         try:
-            response = self.session.get(f"{self.base_url}/recommendations/{patient_id}", timeout=10)
+            response = self.session.get(f"{API_BASE_URL}/recommendations/{patient_id}", timeout=10)
             if response.status_code == 200:
                 return {"status": "success", "data": response.json()}
             else:
@@ -119,9 +209,9 @@ class APIClient:
             return {"status": "error", "message": str(e)}
     
     def get_monitoring_status(self) -> Dict:
-        """Get monitoring system status"""
+        """Get monitoring system status (fallback to API)"""
         try:
-            response = self.session.get(f"{self.base_url}/monitoring/status", timeout=5)
+            response = self.session.get(f"{API_BASE_URL}/monitoring/status", timeout=5)
             if response.status_code == 200:
                 return {"status": "success", "data": response.json()}
             else:
@@ -129,8 +219,8 @@ class APIClient:
         except Exception as e:
             return {"status": "error", "message": str(e)}
 
-# Initialize API client
-api_client = APIClient(API_BASE_URL)
+# Initialize data client
+api_client = DataClient()
 
 # Session state initialization
 if 'logged_in' not in st.session_state:
@@ -593,6 +683,625 @@ Medication Suggestions:
                 mime="text/plain"
             )
 
+def render_cohort_view_tab():
+    """Render cohort risk analysis tab"""
+    st.header("👥 Cohort Risk Analysis")
+    
+    try:
+        # Fetch cohort risk data from Supabase
+        cohort_data = get_cohort_risk_data()
+        
+        if cohort_data:
+            
+            # Display summary metrics
+            col1, col2, col3, col4, col5 = st.columns(5)
+            
+            with col1:
+                st.metric("Total Patients", cohort_data["total_patients"])
+            
+            with col2:
+                st.metric("High Risk", cohort_data["high_risk_count"], 
+                         delta=f"{cohort_data['high_risk_count']/cohort_data['total_patients']*100:.1f}%")
+            
+            with col3:
+                st.metric("Medium Risk", cohort_data["medium_risk_count"],
+                         delta=f"{cohort_data['medium_risk_count']/cohort_data['total_patients']*100:.1f}%")
+            
+            with col4:
+                st.metric("Low Risk", cohort_data["low_risk_count"],
+                         delta=f"{cohort_data['low_risk_count']/cohort_data['total_patients']*100:.1f}%")
+            
+            with col5:
+                st.metric("Avg Risk Score", f"{cohort_data['average_risk_score']:.3f}")
+            
+            st.divider()
+            
+            # Risk distribution chart
+            col1, col2 = st.columns([1, 1])
+            
+            with col1:
+                st.subheader("Risk Distribution")
+                risk_counts = {
+                    "High": cohort_data["high_risk_count"],
+                    "Medium": cohort_data["medium_risk_count"],
+                    "Low": cohort_data["low_risk_count"]
+                }
+                
+                fig_pie = px.pie(
+                    values=list(risk_counts.values()),
+                    names=list(risk_counts.keys()),
+                    color_discrete_map={
+                        "High": "#ff4444",
+                        "Medium": "#ffaa00",
+                        "Low": "#44aa44"
+                    },
+                    title="Patient Risk Categories"
+                )
+                st.plotly_chart(fig_pie, use_container_width=True)
+            
+            with col2:
+                st.subheader("Risk Score Distribution")
+                risk_scores = [patient["risk_score"] for patient in cohort_data["patients"]]
+                
+                fig_hist = px.histogram(
+                    x=risk_scores,
+                    nbins=20,
+                    title="Distribution of Risk Scores",
+                    labels={"x": "Risk Score", "y": "Number of Patients"}
+                )
+                fig_hist.update_layout(showlegend=False)
+                st.plotly_chart(fig_hist, use_container_width=True)
+            
+            st.divider()
+            
+            # Patient risk table
+            st.subheader("Patient Risk Scores")
+            
+            # Convert to DataFrame for better display
+            df_patients = pd.DataFrame(cohort_data["patients"])
+            
+            # Add risk score formatting and styling
+            def style_risk_score(val):
+                if val >= 0.7:
+                    return 'background-color: #ffebee; color: #d32f2f; font-weight: bold'
+                elif val >= 0.4:
+                    return 'background-color: #fff3e0; color: #f57c00; font-weight: bold'
+                else:
+                    return 'background-color: #e8f5e8; color: #388e3c; font-weight: bold'
+            
+            def style_risk_category(val):
+                if val == "High":
+                    return 'background-color: #ffebee; color: #d32f2f; font-weight: bold'
+                elif val == "Medium":
+                    return 'background-color: #fff3e0; color: #f57c00; font-weight: bold'
+                else:
+                    return 'background-color: #e8f5e8; color: #388e3c; font-weight: bold'
+            
+            # Display styled dataframe
+            styled_df = df_patients.style.applymap(style_risk_score, subset=['risk_score']) \
+                                        .applymap(style_risk_category, subset=['risk_category']) \
+                                        .format({'risk_score': '{:.3f}'})
+            
+            st.dataframe(styled_df, use_container_width=True)
+            
+            # Export functionality
+            csv_data = df_patients.to_csv(index=False)
+            st.download_button(
+                label="📊 Download Cohort Data as CSV",
+                data=csv_data,
+                file_name=f"cohort_risk_analysis_{datetime.now().strftime('%Y%m%d')}.csv",
+                mime="text/csv"
+            )
+            
+        else:
+            st.error(f"Failed to fetch cohort data: {response.status_code}")
+            
+    except Exception as e:
+        st.error(f"Error loading cohort data: {str(e)}")
+        st.info("Please ensure the API server is running and accessible.")
+
+def render_model_evaluation_tab():
+    """Render model evaluation metrics tab"""
+    st.header("📊 Model Performance Evaluation")
+    
+    try:
+        # Fetch model evaluation data
+        eval_data = get_model_evaluation_data()
+        
+        if eval_data:
+            
+            # Display model information
+            col1, col2, col3, col4 = st.columns(4)
+            
+            with col1:
+                st.metric("Model Name", eval_data["model_name"])
+            
+            with col2:
+                st.metric("Model Version", eval_data.get("model_version", "N/A"))
+            
+            with col3:
+                st.metric("Sample Size", eval_data["sample_size"])
+            
+            with col4:
+                st.metric("Evaluation Date", eval_data["evaluation_date"][:10])
+            
+            st.divider()
+            
+            # Display key metrics
+            st.subheader("🎯 Key Performance Metrics")
+            
+            metrics = eval_data["metrics"]
+            
+            col1, col2, col3, col4 = st.columns(4)
+            
+            with col1:
+                auroc = metrics.get("auroc", 0)
+                st.metric(
+                    "AUROC", 
+                    f"{auroc:.3f}",
+                    delta="Excellent" if auroc > 0.8 else "Good" if auroc > 0.7 else "Fair"
+                )
+            
+            with col2:
+                auprc = metrics.get("auprc", 0)
+                st.metric(
+                    "AUPRC", 
+                    f"{auprc:.3f}",
+                    delta="Excellent" if auprc > 0.8 else "Good" if auprc > 0.7 else "Fair"
+                )
+            
+            with col3:
+                sensitivity = metrics.get("sensitivity", 0)
+                st.metric(
+                    "Sensitivity (Recall)", 
+                    f"{sensitivity:.3f}",
+                    delta="High" if sensitivity > 0.8 else "Medium" if sensitivity > 0.6 else "Low"
+                )
+            
+            with col4:
+                specificity = metrics.get("specificity", 0)
+                st.metric(
+                    "Specificity", 
+                    f"{specificity:.3f}",
+                    delta="High" if specificity > 0.8 else "Medium" if specificity > 0.6 else "Low"
+                )
+            
+            st.divider()
+            
+            # Additional metrics
+            col1, col2, col3, col4 = st.columns(4)
+            
+            with col1:
+                precision = metrics.get("precision", 0)
+                st.metric("Precision", f"{precision:.3f}")
+            
+            with col2:
+                f1_score = metrics.get("f1_score", 0)
+                st.metric("F1 Score", f"{f1_score:.3f}")
+            
+            with col3:
+                calibration_error = metrics.get("calibration_error", 0)
+                st.metric("Calibration Error", f"{calibration_error:.3f}")
+            
+            with col4:
+                positive_rate = eval_data["positive_cases"] / eval_data["sample_size"]
+                st.metric("Positive Rate", f"{positive_rate:.1%}")
+            
+            st.divider()
+            
+            # Model interpretation
+            st.subheader("🔍 Model Interpretation")
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.markdown("**Clinical Performance:**")
+                if auroc > 0.8:
+                    st.success("🟢 Excellent discriminative ability (AUROC > 0.8)")
+                elif auroc > 0.7:
+                    st.warning("🟡 Good discriminative ability (AUROC > 0.7)")
+                else:
+                    st.error("🔴 Fair discriminative ability (AUROC ≤ 0.7)")
+                
+                if sensitivity > 0.8:
+                    st.success("🟢 High sensitivity - Good at detecting deterioration")
+                elif sensitivity > 0.6:
+                    st.warning("🟡 Moderate sensitivity - May miss some cases")
+                else:
+                    st.error("🔴 Low sensitivity - Missing many deterioration cases")
+            
+            with col2:
+                st.markdown("**Model Reliability:**")
+                if calibration_error < 0.1:
+                    st.success("🟢 Well-calibrated predictions")
+                elif calibration_error < 0.2:
+                    st.warning("🟡 Moderately calibrated predictions")
+                else:
+                    st.error("🔴 Poorly calibrated predictions")
+                
+                if specificity > 0.8:
+                    st.success("🟢 High specificity - Low false alarm rate")
+                elif specificity > 0.6:
+                    st.warning("🟡 Moderate specificity - Some false alarms")
+                else:
+                    st.error("🔴 Low specificity - High false alarm rate")
+            
+            # Recommendations based on metrics
+            st.subheader("💡 Clinical Recommendations")
+            
+            recommendations = []
+            
+            if sensitivity < 0.7:
+                recommendations.append("⚠️ Consider lowering the risk threshold to catch more deterioration cases")
+            
+            if specificity < 0.7:
+                recommendations.append("⚠️ Consider raising the risk threshold to reduce false alarms")
+            
+            if calibration_error > 0.15:
+                recommendations.append("⚠️ Model predictions may need recalibration for clinical use")
+            
+            if auroc < 0.75:
+                recommendations.append("⚠️ Consider feature engineering or model retraining to improve performance")
+            
+            if not recommendations:
+                recommendations.append("✅ Model performance is within acceptable clinical ranges")
+            
+            for rec in recommendations:
+                st.markdown(f"- {rec}")
+            
+        else:
+            st.error(f"Failed to fetch model evaluation: {response.status_code}")
+            
+    except Exception as e:
+        st.error(f"Error loading model evaluation: {str(e)}")
+        st.info("Please ensure the API server is running and accessible.")
+
+def render_explainability_tab():
+    """Render the Model Explainability tab"""
+    st.header("🔍 Model Explainability")
+    st.markdown("""Understand how the AI model makes predictions using SHAP (SHapley Additive exPlanations) 
+    to provide transparent and interpretable risk assessments.""")
+    
+    # Explainability options
+    explainability_type = st.radio(
+        "Select Explanation Type:",
+        ["Global Explanations", "Patient-Specific Explanations"],
+        horizontal=True
+    )
+    
+    if explainability_type == "Global Explanations":
+        st.subheader("🌍 Global Model Explanations")
+        st.markdown("Understanding which factors are most important across all patients for 90-day deterioration risk.")
+        
+        if st.button("Generate Global Explanations", type="primary"):
+            with st.spinner("Generating global model explanations..."):
+                try:
+                    response = requests.post(f"{API_BASE_URL}/explain/global")
+                    if response.status_code == 200:
+                        global_data = response.json()
+                        
+                        # Display global insights
+                        st.success("✅ Global explanations generated successfully!")
+                        
+                        col1, col2 = st.columns([2, 1])
+                        
+                        with col1:
+                            st.subheader("📊 Feature Importance Ranking")
+                            
+                            # Extract feature contributions
+                            feature_contributions = global_data.get("feature_importance", [])
+                            if feature_contributions:
+                                # Create DataFrame for visualization
+                                df_features = pd.DataFrame(feature_contributions)
+                                df_features = df_features.sort_values('abs_shap_value', ascending=False).head(10)
+                                
+                                # Create horizontal bar chart
+                                fig_importance = px.bar(
+                                    df_features,
+                                    x='abs_shap_value',
+                                    y='feature',
+                                    orientation='h',
+                                    color='contribution_type',
+                                    color_discrete_map={
+                                        'increases_risk': '#ff4444',
+                                        'decreases_risk': '#44aa44'
+                                    },
+                                    title="Top 10 Most Important Features",
+                                    labels={
+                                        'abs_shap_value': 'Feature Importance (|SHAP Value|)',
+                                        'feature': 'Clinical Features',
+                                        'contribution_type': 'Impact Type'
+                                    }
+                                )
+                                fig_importance.update_layout(height=500)
+                                st.plotly_chart(fig_importance, use_container_width=True)
+                                
+                                # Feature details table
+                                st.subheader("📋 Detailed Feature Analysis")
+                                display_df = df_features[['feature', 'description', 'abs_shap_value', 'impact_strength', 'contribution_type']].copy()
+                                display_df.columns = ['Feature', 'Clinical Meaning', 'Importance Score', 'Impact Level', 'Effect on Risk']
+                                display_df['Importance Score'] = display_df['Importance Score'].round(4)
+                                st.dataframe(display_df, use_container_width=True)
+                        
+                        with col2:
+                            st.subheader("🎯 Key Insights")
+                            
+                            model_insights = global_data.get("model_insights", {})
+                            
+                            # Top risk factors
+                            st.markdown("**🔴 Top Risk Drivers:**")
+                            top_factors = model_insights.get("most_important_factors", [])
+                            for i, factor in enumerate(top_factors[:5], 1):
+                                st.markdown(f"{i}. **{factor.get('feature', 'N/A')}** (Impact: {factor.get('impact_strength', 'N/A')})")
+                            
+                            # Protective factors
+                            st.markdown("**🟢 Protective Factors:**")
+                            protective_factors = model_insights.get("protective_factors", [])
+                            for i, factor in enumerate(protective_factors[:5], 1):
+                                st.markdown(f"{i}. **{factor.get('feature', 'N/A')}** (Protection: {factor.get('impact_strength', 'N/A')})")
+                            
+                            # Clinical interpretation
+                            st.markdown("**🏥 Clinical Interpretation:**")
+                            st.info(model_insights.get("clinical_interpretation", "No interpretation available."))
+                    
+                    else:
+                        st.error(f"❌ Failed to generate global explanations: {response.status_code}")
+                        
+                except Exception as e:
+                    st.error(f"❌ Error generating global explanations: {str(e)}")
+    
+    else:  # Patient-Specific Explanations
+        st.subheader("👤 Patient-Specific Explanations")
+        st.markdown("Get detailed explanations for why a specific patient has their current risk score.")
+        
+        # Patient selection
+        try:
+            patients_response = requests.get(f"{API_BASE_URL}/patients")
+            if patients_response.status_code == 200:
+                patients_data = patients_response.json()
+                patients = patients_data.get("patients", [])
+                
+                if patients:
+                    # Create patient selection dropdown
+                    patient_options = {f"{p['name']} (ID: {p['id']}) - Age {p['age']}": p['id'] for p in patients}
+                    selected_patient_display = st.selectbox(
+                        "Select a patient for detailed explanation:",
+                        options=list(patient_options.keys())
+                    )
+                    selected_patient_id = patient_options[selected_patient_display]
+                    
+                    if st.button("Generate Patient Explanation", type="primary"):
+                        with st.spinner(f"Generating explanation for {selected_patient_display.split(' (')[0]}..."):
+                            try:
+                                response = requests.post(f"{API_BASE_URL}/explain/local/{selected_patient_id}")
+                                if response.status_code == 200:
+                                    local_data = response.json()
+                                    
+                                    st.success("✅ Patient explanation generated successfully!")
+                                    
+                                    # Patient info and prediction
+                                    col1, col2, col3 = st.columns([1, 1, 1])
+                                    
+                                    prediction = local_data.get("prediction", {})
+                                    
+                                    with col1:
+                                        st.metric(
+                                            "Risk Score", 
+                                            f"{prediction.get('risk_score', 0):.3f}",
+                                            delta=f"Category: {prediction.get('risk_category', 'Unknown')}"
+                                        )
+                                    
+                                    with col2:
+                                        st.metric(
+                                            "Risk Category", 
+                                            prediction.get('risk_category', 'Unknown'),
+                                            delta=f"Model: {prediction.get('model_version', 'v1.0')}"
+                                        )
+                                    
+                                    with col3:
+                                        recommendations = local_data.get("clinical_recommendations", {})
+                                        st.metric(
+                                            "Monitoring Priority", 
+                                            recommendations.get('monitoring_priority', 'Medium')
+                                        )
+                                    
+                                    st.divider()
+                                    
+                                    # Risk drivers and protective factors
+                                    col1, col2 = st.columns([1, 1])
+                                    
+                                    with col1:
+                                        st.subheader("🔴 Risk Drivers")
+                                        risk_drivers = local_data.get("risk_drivers", [])
+                                        
+                                        if risk_drivers:
+                                            for i, driver in enumerate(risk_drivers[:5], 1):
+                                                with st.expander(f"{i}. {driver.get('feature', 'Unknown')} (Impact: {driver.get('impact_strength', 'N/A')})"):
+                                                    st.markdown(f"**Current Value:** {driver.get('formatted_value', 'N/A')}")
+                                                    st.markdown(f"**SHAP Contribution:** {driver.get('shap_value', 0):.4f}")
+                                                    st.markdown(f"**Clinical Meaning:** {driver.get('description', 'No description available')}")
+                                        else:
+                                            st.info("No significant risk drivers identified.")
+                                    
+                                    with col2:
+                                        st.subheader("🟢 Protective Factors")
+                                        protective_factors = local_data.get("protective_factors", [])
+                                        
+                                        if protective_factors:
+                                            for i, factor in enumerate(protective_factors[:5], 1):
+                                                with st.expander(f"{i}. {factor.get('feature', 'Unknown')} (Protection: {factor.get('impact_strength', 'N/A')})"):
+                                                    st.markdown(f"**Current Value:** {factor.get('formatted_value', 'N/A')}")
+                                                    st.markdown(f"**SHAP Contribution:** {factor.get('shap_value', 0):.4f}")
+                                                    st.markdown(f"**Clinical Meaning:** {factor.get('description', 'No description available')}")
+                                        else:
+                                            st.info("No significant protective factors identified.")
+                                    
+                                    # Clinical recommendations
+                                    st.subheader("🏥 Clinical Recommendations")
+                                    recommendations = local_data.get("clinical_recommendations", {})
+                                    
+                                    col1, col2 = st.columns([1, 1])
+                                    with col1:
+                                        st.info(f"**High Impact Factors:** {recommendations.get('high_impact_factors', 'N/A')}")
+                                    
+                                    with col2:
+                                        st.info(f"**Actionable Insights:** {recommendations.get('actionable_insights', 'N/A')}")
+                                
+                                else:
+                                    st.error(f"❌ Failed to generate patient explanation: {response.status_code}")
+                                    
+                            except Exception as e:
+                                st.error(f"❌ Error generating patient explanation: {str(e)}")
+                
+                else:
+                    st.warning("⚠️ No patients available for explanation.")
+            
+            else:
+                st.error("❌ Failed to load patient data.")
+                
+        except Exception as e:
+            st.error(f"❌ Error loading patients: {str(e)}")
+    
+    # Educational content
+    st.divider()
+    st.subheader("📚 Understanding SHAP Explanations")
+    
+    with st.expander("What are SHAP values?"):
+        st.markdown("""
+        **SHAP (SHapley Additive exPlanations)** values provide a unified framework for interpreting model predictions:
+        
+        - **Positive SHAP values** increase the risk prediction
+        - **Negative SHAP values** decrease the risk prediction  
+        - **Magnitude** indicates the strength of the feature's impact
+        - **Sum of all SHAP values** + base value = final prediction
+        
+        This helps clinicians understand exactly which factors contribute to a patient's risk score.
+        """)
+    
+    with st.expander("How to interpret the results?"):
+        st.markdown("""
+        **For Clinical Decision Making:**
+        
+        1. **Focus on high-impact factors** - These have the strongest influence on the prediction
+        2. **Consider modifiable risk factors** - Target interventions on factors that can be changed
+        3. **Monitor protective factors** - Ensure positive factors are maintained
+        4. **Use for patient education** - Help patients understand their specific risk factors
+        5. **Validate with clinical judgment** - AI explanations should complement, not replace, clinical expertise
+        """)
+
+def get_cohort_risk_data() -> Dict:
+    """Get cohort risk analysis data from Supabase"""
+    try:
+        # Get all patients with basic info
+        patients_result = supabase_client.client.table("patients").select("id, name, age, gender, bp, cholesterol, diabetes_status").execute()
+        
+        if not patients_result.data:
+            return None
+        
+        patients = patients_result.data
+        total_patients = len(patients)
+        
+        # Calculate risk categories based on available data
+        high_risk = 0
+        medium_risk = 0
+        low_risk = 0
+        risk_scores = []
+        
+        for patient in patients:
+            # Simple risk calculation based on available fields
+            risk_score = 0.0
+            
+            # Age factor
+            age = patient.get('age', 0)
+            if age > 65:
+                risk_score += 0.3
+            elif age > 50:
+                risk_score += 0.2
+            elif age > 35:
+                risk_score += 0.1
+            
+            # BP factor
+            bp = patient.get('bp', 'normal')
+            if bp == 'high':
+                risk_score += 0.3
+            elif bp == 'elevated':
+                risk_score += 0.2
+            
+            # Cholesterol factor
+            cholesterol = patient.get('cholesterol', 'normal')
+            if cholesterol == 'high':
+                risk_score += 0.2
+            elif cholesterol == 'borderline':
+                risk_score += 0.1
+            
+            # Diabetes factor
+            diabetes = patient.get('diabetes_status', 'none')
+            if diabetes == 'type2':
+                risk_score += 0.3
+            elif diabetes == 'prediabetes':
+                risk_score += 0.2
+            
+            risk_scores.append(risk_score)
+            
+            # Categorize risk
+            if risk_score >= 0.7:
+                high_risk += 1
+            elif risk_score >= 0.4:
+                medium_risk += 1
+            else:
+                low_risk += 1
+        
+        avg_risk_score = sum(risk_scores) / len(risk_scores) if risk_scores else 0
+        
+        return {
+            "total_patients": total_patients,
+            "high_risk_count": high_risk,
+            "medium_risk_count": medium_risk,
+            "low_risk_count": low_risk,
+            "average_risk_score": avg_risk_score,
+            "risk_scores": risk_scores,
+            "patients": patients
+        }
+    except Exception as e:
+        st.error(f"Error fetching cohort data: {e}")
+        return None
+
+def get_model_evaluation_data() -> Dict:
+    """Get model evaluation data (mock data for now)"""
+    try:
+        # Since we don't have model evaluation tables yet, return mock data
+        return {
+            "model_name": "XGBoost Cardiovascular Risk Predictor",
+            "model_version": "v1.2.0",
+            "sample_size": 1000,
+            "evaluation_date": "2024-01-15T10:30:00Z",
+            "metrics": {
+                "auroc": 0.847,
+                "auprc": 0.723,
+                "accuracy": 0.812,
+                "precision": 0.789,
+                "recall": 0.756,
+                "f1_score": 0.772,
+                "specificity": 0.834
+            },
+            "confusion_matrix": {
+                "true_positives": 151,
+                "false_positives": 33,
+                "true_negatives": 667,
+                "false_negatives": 49
+            },
+            "feature_importance": [
+                {"feature": "age", "importance": 0.234},
+                {"feature": "cholesterol_total", "importance": 0.187},
+                {"feature": "bp_systolic", "importance": 0.156},
+                {"feature": "diabetes_status", "importance": 0.143},
+                {"feature": "smoking_status", "importance": 0.098}
+            ]
+        }
+    except Exception as e:
+        st.error(f"Error fetching model evaluation data: {e}")
+        return None
+
 def main():
     """Main dashboard function"""
     
@@ -608,7 +1317,7 @@ def main():
     render_sidebar()
     
     # Main tabs
-    tab1, tab2, tab3 = st.tabs(["👤 Patient Overview", "🎯 Risk Prediction", "📋 Recommendations"])
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["👤 Patient Overview", "🎯 Risk Prediction", "📋 Recommendations", "👥 Cohort View", "📊 Model Evaluation", "🔍 Model Explainability"])
     
     with tab1:
         render_patient_overview_tab()
@@ -618,6 +1327,15 @@ def main():
     
     with tab3:
         render_recommendations_tab()
+    
+    with tab4:
+        render_cohort_view_tab()
+    
+    with tab5:
+        render_model_evaluation_tab()
+    
+    with tab6:
+        render_explainability_tab()
 
 if __name__ == "__main__":
     main()

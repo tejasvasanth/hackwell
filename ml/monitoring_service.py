@@ -6,6 +6,8 @@ import threading
 import json
 from pathlib import Path
 from loguru import logger
+import sys
+import os
 
 from evidently import Report
 from evidently import DataDefinition
@@ -15,6 +17,10 @@ from evidently.metrics import (
     ValueDrift,
     MissingValueCount
 )
+
+# Add project root to path for imports
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from supabase_client import get_supabase_client
 
 class MonitoringService:
     """Service for monitoring model drift, data drift, and label drift using EvidentlyAI"""
@@ -40,6 +46,14 @@ class MonitoringService:
         )
         
         logger.info("MonitoringService initialized")
+        
+        # Initialize Supabase client
+        try:
+            self.supabase = get_supabase_client()
+            logger.info("Supabase client initialized for monitoring")
+        except Exception as e:
+            logger.warning(f"Failed to initialize Supabase client: {e}")
+            self.supabase = None
     
     def set_reference_data(self, data: pd.DataFrame, target_column: str = 'target'):
         """Set reference dataset for drift comparison"""
@@ -105,6 +119,9 @@ class MonitoringService:
                     'timestamp': datetime.now(),
                     'raw_report': report_dict
                 }
+                
+                # Store report in Supabase
+                self.store_monitoring_report(drift_summary)
                 
                 logger.info("Drift report generated successfully")
                 return drift_summary
@@ -337,9 +354,10 @@ class MonitoringService:
         # Store alerts
         self._alerts.extend(alerts)
         
-        # Log alerts
+        # Log alerts and store in Supabase
         for alert in alerts:
             logger.warning(f"DRIFT ALERT [{alert['severity'].upper()}]: {alert['message']}")
+            self._store_alert_in_supabase(alert)
     
     def get_latest_report(self) -> Optional[Dict[str, Any]]:
         """Get the latest drift report"""
@@ -415,6 +433,117 @@ class MonitoringService:
                 'uptime_hours': uptime_hours,
                 'timestamp': datetime.now().isoformat()
             }
+
+    def _store_alert_in_supabase(self, alert: Dict[str, Any]):
+        """Store alert in Supabase database"""
+        if not self.supabase:
+            return
+        
+        try:
+            # Convert alert to Supabase format
+            supabase_alert = {
+                'alert_type': alert['type'],
+                'severity': alert['severity'],
+                'title': f"{alert['type'].replace('_', ' ').title()} Alert",
+                'description': alert['message'],
+                'status': 'active',
+                'triggered_at': alert['timestamp'],
+                'metadata': json.dumps(alert.get('metadata', {})) if alert.get('metadata') else None
+            }
+            
+            self.supabase.client.table('alerts').insert(supabase_alert).execute()
+            logger.debug(f"Alert stored in Supabase: {alert['type']}")
+            
+        except Exception as e:
+            logger.error(f"Failed to store alert in Supabase: {e}")
+    
+    def store_monitoring_report(self, report: Dict[str, Any]):
+        """Store monitoring report in Supabase"""
+        if not self.supabase:
+            return
+        
+        try:
+            # Store in monitoring_reports table
+            monitoring_report = {
+                'report_type': 'drift_analysis',
+                'timestamp': report.get('timestamp', datetime.now().isoformat()),
+                'data_drift_detected': report.get('data_drift', {}).get('dataset_drift', False),
+                'target_drift_detected': report.get('target_drift', {}).get('drift_detected', False),
+                'prediction_drift_detected': report.get('prediction_drift', {}).get('drift_detected', False),
+                'data_quality_score': 1.0 - report.get('data_quality', {}).get('missing_values_share', 0.0),
+                'overall_health': report.get('summary', {}).get('overall_health', 'unknown'),
+                'risk_level': report.get('summary', {}).get('risk_level', 'unknown'),
+                'report_data': json.dumps(report)
+            }
+            
+            self.supabase.client.table('monitoring_reports').insert(monitoring_report).execute()
+            logger.debug("Monitoring report stored in Supabase")
+            
+        except Exception as e:
+            logger.error(f"Failed to store monitoring report in Supabase: {e}")
+    
+    def load_data_from_supabase(self, limit: int = 1000) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
+        """Load patient data from Supabase for monitoring"""
+        if not self.supabase:
+            logger.warning("Supabase client not available")
+            return None, None
+        
+        try:
+            # Get patient data with lab results
+            patients_response = self.supabase.client.table('patients').select('*').limit(limit).execute()
+            lab_results_response = self.supabase.client.table('lab_results').select('*').limit(limit * 5).execute()
+            
+            if not patients_response.data or not lab_results_response.data:
+                logger.warning("No data found in Supabase")
+                return None, None
+            
+            # Convert to DataFrames
+            patients_df = pd.DataFrame(patients_response.data)
+            lab_results_df = pd.DataFrame(lab_results_response.data)
+            
+            # Pivot lab results to get features per patient
+            lab_pivot = lab_results_df.pivot_table(
+                index='patient_id',
+                columns='test_name',
+                values='value',
+                aggfunc='mean'
+            ).reset_index()
+            
+            # Merge patient data with lab results
+            monitoring_data = patients_df.merge(lab_pivot, left_on='id', right_on='patient_id', how='left')
+            
+            # Add required columns for monitoring
+            monitoring_data['diabetes'] = (monitoring_data.get('blood_glucose', 100) > 126).astype(int)
+            monitoring_data['smoking'] = np.random.choice([0, 1], len(monitoring_data), p=[0.7, 0.3])  # Placeholder
+            monitoring_data['family_history'] = np.random.choice([0, 1], len(monitoring_data), p=[0.6, 0.4])  # Placeholder
+            monitoring_data['gender'] = (monitoring_data['gender'] == 'Male').astype(int)
+            monitoring_data['exercise_frequency'] = np.random.poisson(3, len(monitoring_data))  # Placeholder
+            
+            # Calculate risk score
+            monitoring_data['risk_score'] = (
+                monitoring_data['age'] * 0.02 +
+                monitoring_data.get('cholesterol', 200) * 0.01 +
+                monitoring_data.get('blood_pressure_systolic', 120) * 0.015 +
+                monitoring_data['bmi'] * 0.1 +
+                monitoring_data['diabetes'] * 10 +
+                monitoring_data['smoking'] * 8 +
+                monitoring_data['family_history'] * 5
+            )
+            
+            monitoring_data['target'] = (monitoring_data['risk_score'] > monitoring_data['risk_score'].median()).astype(int)
+            monitoring_data['prediction'] = np.random.uniform(0, 1, len(monitoring_data))  # Placeholder
+            
+            # Split into reference and current data (70/30 split)
+            split_idx = int(len(monitoring_data) * 0.7)
+            reference_data = monitoring_data.iloc[:split_idx].copy()
+            current_data = monitoring_data.iloc[split_idx:].copy()
+            
+            logger.info(f"Loaded {len(reference_data)} reference samples and {len(current_data)} current samples from Supabase")
+            return reference_data, current_data
+            
+        except Exception as e:
+            logger.error(f"Failed to load data from Supabase: {e}")
+            return None, None
 
 # Global monitoring service instance
 monitoring_service = MonitoringService()

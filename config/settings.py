@@ -9,7 +9,7 @@ class Settings(BaseSettings):
     
     # Database settings
     supabase_url: Optional[str] = None
-    supabase_key: Optional[str] = None
+    supabase_anon_key: Optional[str] = None
     database_url: Optional[str] = None
     
     # MLflow settings

@@ -39,10 +39,10 @@ class SupabaseClient:
     def _initialize_client(self):
         """Initialize Supabase client"""
         try:
-            if settings.supabase_url and settings.supabase_key:
+            if settings.supabase_url and settings.supabase_anon_key:
                 self.client = create_client(
                     settings.supabase_url,
-                    settings.supabase_key
+                    settings.supabase_anon_key
                 )
                 logger.info("Supabase client initialized successfully")
             else:

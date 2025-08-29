@@ -2,8 +2,14 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Tuple
+from typing import Tuple, Optional
 from loguru import logger
+import sys
+import os
+
+# Add project root to path for imports
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from supabase_client import get_supabase_client
 
 def generate_healthcare_data(
     n_samples: int = 1000,
@@ -163,6 +169,171 @@ def save_monitoring_datasets(output_dir: str = "data/monitoring"):
     
     logger.info(f"All monitoring datasets saved to {output_path}")
     return output_path
+
+def store_sample_data_in_supabase(
+    n_patients: int = 50,
+    n_lab_results_per_patient: int = 10,
+    n_lifestyle_records_per_patient: int = 5
+) -> bool:
+    """Generate and store sample healthcare data directly in Supabase
+    
+    Args:
+        n_patients: Number of patients to generate
+        n_lab_results_per_patient: Number of lab results per patient
+        n_lifestyle_records_per_patient: Number of lifestyle records per patient
+    
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        supabase = get_supabase_client()
+        logger.info(f"Generating sample data for {n_patients} patients")
+        
+        # Generate patient data
+        patients_data = []
+        for i in range(n_patients):
+            patient_id = f"P{i+1:03d}"
+            age = np.random.randint(25, 85)
+            gender = np.random.choice(['Male', 'Female'])
+            
+            patients_data.append({
+                'id': patient_id,
+                'name': f"Patient {i+1}",
+                'age': int(age),
+                'gender': gender,
+                'admission_date': (datetime.now() - timedelta(days=np.random.randint(1, 365))).isoformat(),
+                'height': float(np.random.normal(170, 10)),
+                'weight': float(np.random.normal(70, 15)),
+                'bmi': float(np.random.normal(25, 4)),
+                'ethnicity': np.random.choice(['Caucasian', 'Hispanic', 'African American', 'Asian', 'Other']),
+                'insurance_type': np.random.choice(['Private', 'Medicare', 'Medicaid', 'Uninsured']),
+                'blood_type': np.random.choice(['A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', 'O+', 'O-']),
+                'phone': f"+1-555-{np.random.randint(1000, 9999)}",
+                'medical_history': [],
+                'current_medications': [],
+                'risk_factors': []
+            })
+        
+        # Insert patients
+        result = supabase.client.table('patients').insert(patients_data).execute()
+        logger.info(f"Inserted {len(patients_data)} patients")
+        
+        # Generate lab results
+        lab_results_data = []
+        lab_types = ['cholesterol', 'blood_glucose', 'blood_pressure_systolic', 'blood_pressure_diastolic', 
+                    'heart_rate', 'bmi', 'hba1c', 'ldl', 'hdl', 'triglycerides']
+        
+        for patient_data in patients_data:
+            patient_id = patient_data['id']
+            for _ in range(n_lab_results_per_patient):
+                lab_type = np.random.choice(lab_types)
+                
+                # Generate realistic values based on lab type
+                if lab_type == 'cholesterol':
+                    value = np.random.normal(200, 40)
+                elif lab_type == 'blood_glucose':
+                    value = np.random.normal(100, 20)
+                elif lab_type == 'blood_pressure_systolic':
+                    value = np.random.normal(120, 20)
+                elif lab_type == 'blood_pressure_diastolic':
+                    value = np.random.normal(80, 10)
+                elif lab_type == 'heart_rate':
+                    value = np.random.normal(70, 15)
+                elif lab_type == 'bmi':
+                    value = np.random.normal(25, 4)
+                elif lab_type == 'hba1c':
+                    value = np.random.normal(5.5, 1.0)
+                elif lab_type == 'ldl':
+                    value = np.random.normal(100, 30)
+                elif lab_type == 'hdl':
+                    value = np.random.normal(50, 15)
+                else:  # triglycerides
+                    value = np.random.normal(150, 50)
+                
+                lab_results_data.append({
+                    'patient_id': patient_id,
+                    'test_name': lab_type,
+                    'value': float(max(0, value)),  # Ensure positive values
+                    'unit': 'mg/dL' if lab_type in ['cholesterol', 'blood_glucose', 'ldl', 'hdl', 'triglycerides'] else 
+                           'mmHg' if 'blood_pressure' in lab_type else 
+                           'bpm' if lab_type == 'heart_rate' else 
+                           'kg/m²' if lab_type == 'bmi' else '%',
+                    'reference_range': '< 200' if lab_type == 'cholesterol' else 'Normal',
+                    'status': np.random.choice(['Normal', 'High', 'Low'], p=[0.7, 0.2, 0.1]),
+                    'test_date': (datetime.now() - timedelta(days=np.random.randint(1, 90))).isoformat()
+                })
+        
+        # Insert lab results in batches
+        batch_size = 100
+        for i in range(0, len(lab_results_data), batch_size):
+            batch = lab_results_data[i:i+batch_size]
+            supabase.client.table('lab_results').insert(batch).execute()
+        
+        logger.info(f"Inserted {len(lab_results_data)} lab results")
+        
+        # Generate lifestyle data
+        lifestyle_data = []
+        lifestyle_types = ['steps', 'sleep_hours', 'exercise_minutes', 'calories_consumed', 'water_intake']
+        
+        for patient_data in patients_data:
+            patient_id = patient_data['id']
+            for _ in range(n_lifestyle_records_per_patient):
+                lifestyle_type = np.random.choice(lifestyle_types)
+                
+                if lifestyle_type == 'steps':
+                    value = np.random.normal(8000, 3000)
+                elif lifestyle_type == 'sleep_hours':
+                    value = np.random.normal(7.5, 1.5)
+                elif lifestyle_type == 'exercise_minutes':
+                    value = np.random.normal(30, 20)
+                elif lifestyle_type == 'calories_consumed':
+                    value = np.random.normal(2000, 400)
+                else:  # water_intake
+                    value = np.random.normal(2.5, 0.8)
+                
+                lifestyle_data.append({
+                    'patient_id': patient_id,
+                    'activity_type': lifestyle_type,
+                    'value': float(max(0, value)),
+                    'unit': 'steps' if lifestyle_type == 'steps' else 
+                           'hours' if lifestyle_type == 'sleep_hours' else 
+                           'minutes' if lifestyle_type == 'exercise_minutes' else 
+                           'calories' if lifestyle_type == 'calories_consumed' else 'liters',
+                    'recorded_date': (datetime.now() - timedelta(days=np.random.randint(1, 30))).isoformat()
+                })
+        
+        # Insert lifestyle data in batches
+        for i in range(0, len(lifestyle_data), batch_size):
+            batch = lifestyle_data[i:i+batch_size]
+            supabase.client.table('lifestyle_data').insert(batch).execute()
+        
+        logger.info(f"Inserted {len(lifestyle_data)} lifestyle records")
+        
+        # Generate some predictions
+        predictions_data = []
+        for patient_data in patients_data:
+            patient_id = patient_data['id']
+            # Generate 1-3 predictions per patient
+            for _ in range(np.random.randint(1, 4)):
+                risk_probability = np.random.uniform(0.1, 0.9)
+                predictions_data.append({
+                    'patient_id': patient_id,
+                    'prediction': 'high_risk' if risk_probability > 0.6 else 'medium_risk' if risk_probability > 0.3 else 'low_risk',
+                    'probability': float(risk_probability),
+                    'model_name': 'cardiovascular_risk_model_v1',
+                    'timestamp': (datetime.now() - timedelta(days=np.random.randint(1, 7))).isoformat()
+                })
+        
+        # Insert predictions
+        supabase.client.table('predictions').insert(predictions_data).execute()
+        logger.info(f"Inserted {len(predictions_data)} predictions")
+        
+        logger.info("Successfully generated and stored sample data in Supabase")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error storing sample data in Supabase: {str(e)}")
+        return False
 
 def load_monitoring_data(data_dir: str = "data/monitoring") -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Load reference and current data for monitoring
